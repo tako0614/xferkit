@@ -1,0 +1,20 @@
+{
+  "name": "xferkit",
+  "version": "0.1.0",
+  "description": "Message pipeline for postMessage/BroadcastChannel with compression and encryption.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json"
+  }
+}
