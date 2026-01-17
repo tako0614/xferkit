@@ -1,4 +1,4 @@
-import type { CompressAlgo, EncryptAlgo } from "./types.js";
+import type { AuthAlgo, CompressAlgo, EncryptAlgo } from "./types.js";
 
 export const XFERKIT_VERSION = 1 as const;
 
@@ -19,7 +19,7 @@ export type BinaryType =
   | "BigInt64Array"
   | "BigUint64Array";
 
-export type Frame = DataFrame | AckFrame | NackFrame;
+export type Frame = DataFrame | AckFrame | NackFrame | ControlFrame;
 
 export type DataFrame = {
   __xferkit: 1;
@@ -49,6 +49,11 @@ export type DataFrame = {
     encrypt?: EncryptAlgo;
     keyId?: string;
   };
+  auth?: {
+    algo: AuthAlgo;
+    keyId?: string;
+  };
+  authTag?: ArrayBuffer;
   iv?: ArrayBuffer;
 };
 
@@ -85,6 +90,17 @@ export type NackFrame = {
   };
 };
 
+export type ControlFrame = {
+  __xferkit: 1;
+  v: typeof XFERKIT_VERSION;
+  kind: "control";
+  channel: string;
+  type: "handshake-init" | "handshake-reply" | "handshake-ack";
+  handshakeId: string;
+  curve?: "P-256" | "P-384" | "P-521";
+  pub?: ArrayBuffer;
+};
+
 export function isFrame(value: unknown): value is Frame {
   if (!value || typeof value !== "object") {
     return false;
@@ -103,4 +119,8 @@ export function isAckFrame(frame: Frame): frame is AckFrame {
 
 export function isNackFrame(frame: Frame): frame is NackFrame {
   return frame.kind === "nack";
+}
+
+export function isControlFrame(frame: Frame): frame is ControlFrame {
+  return frame.kind === "control";
 }

@@ -1,11 +1,12 @@
 # xferkit
 
 High-level message pipeline for postMessage/BroadcastChannel with:
-- compression and encryption
+- compression, encryption, and auth tags
 - transferList auto extraction
-- chunking with ack/retry and backpressure
+- adaptive chunking with ack/retry and backpressure
 - ordering controls
 - stream send/receive
+- optional ECDH handshake and session resume
 
 This library targets browser Web APIs (Window, Worker, MessagePort, BroadcastChannel).
 
@@ -19,6 +20,7 @@ const channel = createXfer(worker, {
   codec: {
     compress: { algo: "brotli", fallback: "skip" },
     encrypt: { algo: "aes-gcm", key: myKey },
+    auth: { key: myAuthKey },
   },
   chunk: { maxBytes: 256 * 1024 },
   reliability: {
@@ -34,6 +36,52 @@ channel.on("message", (msg) => {
 });
 
 await channel.send({ kind: "hello", payload: "world" });
+```
+
+## Auth tags
+
+```ts
+const channel = createXfer(worker, {
+  codec: {
+    encrypt: { algo: "aes-gcm", key: myKey },
+    auth: { key: myAuthKey, required: true },
+  },
+});
+```
+
+## Handshake (ECDH)
+
+```ts
+const channel = createXfer(worker, {
+  codec: { encrypt: { algo: "aes-gcm", key: fallbackKey } },
+  handshake: { auto: true, curve: "P-256" },
+});
+
+await channel.handshake();
+```
+
+## Session resume
+
+```ts
+const channel = createXfer(worker, {
+  session: {
+    id: "chat-room",
+    persistOutbound: true,
+    persistInbound: true,
+    ttlMs: 5 * 60_000,
+  },
+});
+```
+
+## Adaptive chunking
+
+```ts
+const channel = createXfer(worker, {
+  chunk: {
+    maxBytes: 256 * 1024,
+    auto: { minBytes: 4096, maxBytes: 256 * 1024 },
+  },
+});
 ```
 
 ## Stream send/receive

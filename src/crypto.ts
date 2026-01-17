@@ -13,6 +13,61 @@ export async function generateAesGcmKey(
   );
 }
 
+export async function generateEcdhKeyPair(
+  curve: "P-256" | "P-384" | "P-521" = "P-256"
+): Promise<CryptoKeyPair> {
+  if (!globalThis.crypto?.subtle) {
+    throw new Error("WebCrypto is not available in this environment.");
+  }
+  return globalThis.crypto.subtle.generateKey(
+    { name: "ECDH", namedCurve: curve },
+    true,
+    ["deriveKey", "deriveBits"]
+  );
+}
+
+export async function exportPublicKeyRaw(
+  publicKey: CryptoKey
+): Promise<ArrayBuffer> {
+  if (!globalThis.crypto?.subtle) {
+    throw new Error("WebCrypto is not available in this environment.");
+  }
+  return globalThis.crypto.subtle.exportKey("raw", publicKey);
+}
+
+export async function importPublicKeyRaw(
+  raw: ArrayBuffer,
+  curve: "P-256" | "P-384" | "P-521" = "P-256"
+): Promise<CryptoKey> {
+  if (!globalThis.crypto?.subtle) {
+    throw new Error("WebCrypto is not available in this environment.");
+  }
+  return globalThis.crypto.subtle.importKey(
+    "raw",
+    raw,
+    { name: "ECDH", namedCurve: curve },
+    true,
+    []
+  );
+}
+
+export async function deriveSharedAesKey(
+  privateKey: CryptoKey,
+  publicKey: CryptoKey,
+  length: 128 | 192 | 256 = 256
+): Promise<CryptoKey> {
+  if (!globalThis.crypto?.subtle) {
+    throw new Error("WebCrypto is not available in this environment.");
+  }
+  return globalThis.crypto.subtle.deriveKey(
+    { name: "ECDH", public: publicKey },
+    privateKey,
+    { name: "AES-GCM", length },
+    true,
+    ["encrypt", "decrypt"]
+  );
+}
+
 export async function deriveKeyFromPassphrase(
   passphrase: string,
   salt: Uint8Array,

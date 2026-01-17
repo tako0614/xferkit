@@ -7,6 +7,16 @@ export interface XferCompressOptions {
   fallback?: "error" | "skip";
 }
 
+export type AuthAlgo = "hmac-sha-256";
+
+export interface XferAuthOptions {
+  algo?: AuthAlgo;
+  key: CryptoKey | XferKeyring;
+  keyId?: string;
+  required?: boolean;
+  skipIfEncrypted?: boolean;
+}
+
 export interface XferKeyring {
   current: CryptoKey;
   currentId?: string;
@@ -23,14 +33,23 @@ export interface XferEncryptOptions {
 export interface XferCodecOptions {
   compress?: XferCompressOptions;
   encrypt?: XferEncryptOptions;
+  auth?: XferAuthOptions;
 }
 
 export interface XferTransferOptions {
   auto?: boolean;
 }
 
+export interface XferAdaptiveChunkOptions {
+  minBytes?: number;
+  maxBytes?: number;
+  increaseStep?: number;
+  decreaseFactor?: number;
+}
+
 export interface XferChunkOptions {
   maxBytes?: number;
+  auto?: XferAdaptiveChunkOptions;
 }
 
 export interface XferStreamSendOptions {
@@ -39,6 +58,26 @@ export interface XferStreamSendOptions {
   timeoutMs?: number;
   signal?: AbortSignal;
   meta?: unknown;
+}
+
+export interface XferBackpressureOptions {
+  deferAck?: boolean;
+  maxQueue?: number;
+  maxStreamBufferBytes?: number;
+}
+
+export interface XferHandshakeOptions {
+  auto?: boolean;
+  timeoutMs?: number;
+  curve?: "P-256" | "P-384" | "P-521";
+}
+
+export interface XferSessionOptions {
+  id: string;
+  storage?: Storage;
+  persistOutbound?: boolean;
+  persistInbound?: boolean;
+  ttlMs?: number;
 }
 
 export interface XferReliabilityOptions {
@@ -62,6 +101,9 @@ export interface XferOptions {
   chunk?: XferChunkOptions;
   reliability?: XferReliabilityOptions;
   targetOrigin?: string;
+  backpressure?: XferBackpressureOptions;
+  handshake?: XferHandshakeOptions;
+  session?: XferSessionOptions;
 }
 
 export interface XferSendOptions {
@@ -77,7 +119,8 @@ export type XferStatus =
   | { type: "send"; id: string; chunks: number }
   | { type: "ack"; id: string }
   | { type: "retry"; id: string; attempt: number }
-  | { type: "drop"; id: string; reason: string };
+  | { type: "drop"; id: string; reason: string }
+  | { type: "resume"; id: string };
 
 export interface XferStats {
   sentMessages: number;
@@ -100,6 +143,7 @@ export interface Xfer {
   ): Promise<void>;
   on(event: XferEvent, handler: XferHandler): () => void;
   createMessageStream(): ReadableStream<unknown>;
+  handshake(options?: XferHandshakeOptions): Promise<CryptoKey>;
   close(): void;
   getStats(): XferStats;
 }

@@ -1,7 +1,9 @@
 import type { BinaryType, PayloadFormat } from "./envelope.js";
 import type {
+  AuthAlgo,
   CompressAlgo,
   EncryptAlgo,
+  XferAuthOptions,
   XferCodecOptions,
   XferEncryptOptions,
   XferKeyring,
@@ -129,7 +131,59 @@ export type CodecInfo = {
   compress?: CompressAlgo;
   encrypt?: EncryptAlgo;
   keyId?: string;
+  auth?: AuthInfo;
 };
+
+export type AuthInfo = {
+  algo: AuthAlgo;
+  keyId?: string;
+};
+
+export async function createAuthTag(
+  bytes: Uint8Array,
+  options: XferAuthOptions | undefined,
+  encrypted: boolean
+): Promise<{ auth: AuthInfo; tag: Uint8Array } | null> {
+  if (!options) {
+    return null;
+  }
+  if (encrypted && options.skipIfEncrypted !== false && !options.required) {
+    return null;
+  }
+  const algo = options.algo ?? "hmac-sha-256";
+  const keyInfo = normalizeKey(options.key, options.keyId, true);
+  const tag = await hmacSign(bytes, keyInfo.key, algo);
+  return { auth: { algo, keyId: keyInfo.keyId }, tag };
+}
+
+export async function verifyAuthTag(
+  bytes: Uint8Array,
+  auth: AuthInfo | undefined,
+  tag: Uint8Array | undefined,
+  options: XferAuthOptions | undefined,
+  encrypted: boolean
+): Promise<void> {
+  if (!auth) {
+    if (options?.required) {
+      throw new Error("Missing auth tag for payload.");
+    }
+    return;
+  }
+  if (!tag) {
+    throw new Error("Missing auth tag bytes.");
+  }
+  if (encrypted && options?.skipIfEncrypted !== false && !options?.required) {
+    return;
+  }
+  const key = resolveAuthKey(options, auth.keyId);
+  if (!key) {
+    throw new Error("Missing auth key for payload.");
+  }
+  const ok = await hmacVerify(bytes, tag, key, auth.algo);
+  if (!ok) {
+    throw new Error("Auth tag verification failed.");
+  }
+}
 
 function reviveBinaryView(buffer: ArrayBuffer, binType: BinaryType): ArrayBufferView {
   switch (binType) {
@@ -275,6 +329,41 @@ async function decryptBytes(
   return new Uint8Array(decrypted);
 }
 
+async function hmacSign(
+  bytes: Uint8Array,
+  key: CryptoKey,
+  algo: AuthAlgo
+): Promise<Uint8Array> {
+  if (!globalThis.crypto?.subtle) {
+    throw new Error("WebCrypto is not available in this environment.");
+  }
+  const hash = algo === "hmac-sha-256" ? "SHA-256" : "SHA-256";
+  const signature = await globalThis.crypto.subtle.sign(
+    { name: "HMAC", hash },
+    key,
+    bytes
+  );
+  return new Uint8Array(signature);
+}
+
+async function hmacVerify(
+  bytes: Uint8Array,
+  tag: Uint8Array,
+  key: CryptoKey,
+  algo: AuthAlgo
+): Promise<boolean> {
+  if (!globalThis.crypto?.subtle) {
+    throw new Error("WebCrypto is not available in this environment.");
+  }
+  const hash = algo === "hmac-sha-256" ? "SHA-256" : "SHA-256";
+  return globalThis.crypto.subtle.verify(
+    { name: "HMAC", hash },
+    key,
+    tag,
+    bytes
+  );
+}
+
 function resolveEncryptOptions(
   options: XferEncryptOptions
 ): { algo: EncryptAlgo; key: CryptoKey; keyId?: string; ivLength?: number } {
@@ -289,6 +378,30 @@ function resolveEncryptOptions(
 
 function resolveDecryptKey(
   options: XferEncryptOptions | undefined,
+  keyId: string | undefined
+): CryptoKey | null {
+  if (!options) {
+    return null;
+  }
+  if (isKeyring(options.key)) {
+    const ring = options.key;
+    const effectiveId = keyId ?? options.keyId;
+    if (effectiveId) {
+      if (ring.keys && ring.keys[effectiveId]) {
+        return ring.keys[effectiveId];
+      }
+      if (ring.currentId === effectiveId) {
+        return ring.current;
+      }
+      return null;
+    }
+    return ring.current;
+  }
+  return options.key;
+}
+
+function resolveAuthKey(
+  options: XferAuthOptions | undefined,
   keyId: string | undefined
 ): CryptoKey | null {
   if (!options) {

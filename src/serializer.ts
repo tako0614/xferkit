@@ -1,94 +1,229 @@
 import type { BinaryType } from "./envelope.js";
+import { base64ToBytes, bytesToBase64 } from "./util.js";
 
 const TAG = "$xferkit";
 
 type TaggedValue =
-  | { [TAG]: "ArrayBuffer"; data: string }
-  | { [TAG]: BinaryType; data: string }
-  | { [TAG]: "Date"; value: string }
-  | { [TAG]: "Map"; entries: [unknown, unknown][] }
-  | { [TAG]: "Set"; values: unknown[] }
+  | { [TAG]: "Ref"; id: number }
+  | { [TAG]: "Object"; id: number; value: Record<string, unknown> }
+  | { [TAG]: "Array"; id: number; items: unknown[] }
+  | { [TAG]: "ArrayBuffer"; id: number; data: string }
+  | { [TAG]: BinaryType; id: number; data: string }
+  | { [TAG]: "Date"; id: number; value: string }
+  | { [TAG]: "Map"; id: number; entries: [unknown, unknown][] }
+  | { [TAG]: "Set"; id: number; values: unknown[] }
   | { [TAG]: "BigInt"; value: string };
 
+type EncodeState = {
+  seen: WeakMap<object, number>;
+  nextId: number;
+};
+
 export function stringifyWithTags(value: unknown): string {
-  return JSON.stringify(value, replacer);
+  const state: EncodeState = { seen: new WeakMap(), nextId: 1 };
+  const encoded = encodeValue(value, state);
+  return JSON.stringify(encoded);
 }
 
 export function parseWithTags(text: string): unknown {
-  return JSON.parse(text, reviver);
+  const decoded = JSON.parse(text);
+  const refs = new Map<number, unknown>();
+  collectRefs(decoded, refs);
+  return inflate(decoded, refs);
 }
 
-function replacer(_key: string, value: unknown): unknown {
+function encodeValue(value: unknown, state: EncodeState): unknown {
+  if (typeof value === "bigint") {
+    return { [TAG]: "BigInt", value: value.toString() };
+  }
+  if (!value || typeof value !== "object") {
+    return value;
+  }
+
+  const existing = state.seen.get(value);
+  if (existing) {
+    return { [TAG]: "Ref", id: existing };
+  }
+
+  const id = state.nextId;
+  state.nextId += 1;
+  state.seen.set(value, id);
+
   if (value instanceof ArrayBuffer) {
-    return { [TAG]: "ArrayBuffer", data: bytesToBase64(new Uint8Array(value)) };
+    return { [TAG]: "ArrayBuffer", id, data: bytesToBase64(new Uint8Array(value)) };
   }
 
   if (ArrayBuffer.isView(value)) {
     const view = value as ArrayBufferView;
     const bytes = new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
     const type = getBinaryType(view);
-    return { [TAG]: type, data: bytesToBase64(bytes) };
+    return { [TAG]: type, id, data: bytesToBase64(bytes) };
   }
 
   if (value instanceof Map) {
-    return { [TAG]: "Map", entries: Array.from(value.entries()) };
+    return {
+      [TAG]: "Map",
+      id,
+      entries: Array.from(value.entries()).map(([k, v]) => [
+        encodeValue(k, state),
+        encodeValue(v, state),
+      ]),
+    };
   }
 
   if (value instanceof Set) {
-    return { [TAG]: "Set", values: Array.from(value.values()) };
+    return {
+      [TAG]: "Set",
+      id,
+      values: Array.from(value.values()).map((v) => encodeValue(v, state)),
+    };
   }
 
   if (value instanceof Date) {
-    return { [TAG]: "Date", value: value.toISOString() };
+    return { [TAG]: "Date", id, value: value.toISOString() };
   }
 
-  if (typeof value === "bigint") {
-    return { [TAG]: "BigInt", value: value.toString() };
+  if (Array.isArray(value)) {
+    return {
+      [TAG]: "Array",
+      id,
+      items: value.map((item) => encodeValue(item, state)),
+    };
   }
 
-  return value;
+  const record: Record<string, unknown> = {};
+  for (const [key, entry] of Object.entries(value)) {
+    record[key] = encodeValue(entry, state);
+  }
+  return { [TAG]: "Object", id, value: record };
 }
 
-function reviver(_key: string, value: unknown): unknown {
-  if (!value || typeof value !== "object") {
-    return value;
+function collectRefs(node: unknown, refs: Map<number, unknown>) {
+  if (!node || typeof node !== "object") {
+    return;
   }
-
-  const tagged = value as TaggedValue;
+  const tagged = node as TaggedValue;
   if (!(TAG in tagged)) {
-    return value;
+    return;
   }
+  const tag = (tagged as any)[TAG] as TaggedValue[typeof TAG];
+  if (tag === "Ref") {
+    return;
+  }
+  if ("id" in tagged) {
+    const id = tagged.id;
+    if (!refs.has(id)) {
+      switch (tag) {
+        case "Array":
+          refs.set(id, []);
+          (tagged as { items: unknown[] }).items.forEach((item) =>
+            collectRefs(item, refs)
+          );
+          break;
+        case "Object":
+          refs.set(id, {});
+          Object.values((tagged as { value: Record<string, unknown> }).value).forEach(
+            (value) => collectRefs(value, refs)
+          );
+          break;
+        case "Map":
+          refs.set(id, new Map());
+          (tagged as { entries: [unknown, unknown][] }).entries.forEach(([k, v]) => {
+            collectRefs(k, refs);
+            collectRefs(v, refs);
+          });
+          break;
+        case "Set":
+          refs.set(id, new Set());
+          (tagged as { values: unknown[] }).values.forEach((value) =>
+            collectRefs(value, refs)
+          );
+          break;
+        case "ArrayBuffer": {
+          const payload = tagged as { data: string };
+          refs.set(id, base64ToBytes(payload.data).buffer);
+          break;
+        }
+        case "Date": {
+          const payload = tagged as { value: string };
+          refs.set(id, new Date(payload.value));
+          break;
+        }
+        default: {
+          if (tag === "BigInt") {
+            return;
+          }
+          const payload = tagged as { data: string };
+          const bytes = base64ToBytes(payload.data);
+          refs.set(id, buildTypedView(tag as BinaryType, bytes));
+          break;
+        }
+      }
+    }
+  }
+}
 
+function inflate(node: unknown, refs: Map<number, unknown>): unknown {
+  if (!node || typeof node !== "object") {
+    return node;
+  }
+  const tagged = node as TaggedValue;
+  if (!(TAG in tagged)) {
+    return node;
+  }
   const tag = (tagged as any)[TAG] as TaggedValue[typeof TAG];
   switch (tag) {
-    case "ArrayBuffer": {
-      const payload = tagged as { [TAG]: "ArrayBuffer"; data: string };
-      const bytes = base64ToBytes(payload.data);
-      return bytes.buffer;
+    case "Ref": {
+      return refs.get((tagged as { id: number }).id);
     }
-    case "Date": {
-      const payload = tagged as { [TAG]: "Date"; value: string };
-      return new Date(payload.value);
+    case "Object": {
+      const payload = tagged as { id: number; value: Record<string, unknown> };
+      const target = (refs.get(payload.id) as Record<string, unknown>) ?? {};
+      for (const [key, value] of Object.entries(payload.value)) {
+        target[key] = inflate(value, refs);
+      }
+      return target;
+    }
+    case "Array": {
+      const payload = tagged as { id: number; items: unknown[] };
+      const target = (refs.get(payload.id) as unknown[]) ?? [];
+      target.length = 0;
+      for (const item of payload.items) {
+        target.push(inflate(item, refs));
+      }
+      return target;
     }
     case "Map": {
-      const payload = tagged as { [TAG]: "Map"; entries: [unknown, unknown][] };
-      return new Map(payload.entries);
+      const payload = tagged as { id: number; entries: [unknown, unknown][] };
+      const target = (refs.get(payload.id) as Map<unknown, unknown>) ?? new Map();
+      target.clear();
+      for (const [key, value] of payload.entries) {
+        target.set(inflate(key, refs), inflate(value, refs));
+      }
+      return target;
     }
     case "Set": {
-      const payload = tagged as { [TAG]: "Set"; values: unknown[] };
-      return new Set(payload.values);
-    }
-    case "BigInt":
-      if (typeof BigInt === "undefined") {
-        const payload = tagged as { [TAG]: "BigInt"; value: string };
-        return payload.value;
+      const payload = tagged as { id: number; values: unknown[] };
+      const target = (refs.get(payload.id) as Set<unknown>) ?? new Set();
+      target.clear();
+      for (const value of payload.values) {
+        target.add(inflate(value, refs));
       }
-      return BigInt((tagged as { [TAG]: "BigInt"; value: string }).value);
+      return target;
+    }
+    case "Date": {
+      return refs.get((tagged as { id: number }).id);
+    }
+    case "ArrayBuffer":
+      return refs.get((tagged as { id: number }).id);
+    case "BigInt": {
+      if (typeof BigInt === "undefined") {
+        return (tagged as { value: string }).value;
+      }
+      return BigInt((tagged as { value: string }).value);
+    }
     default: {
-      const payload = tagged as { [TAG]: BinaryType; data: string };
-      const type = payload[TAG];
-      const bytes = base64ToBytes(payload.data);
-      return buildTypedView(type, bytes);
+      return refs.get((tagged as { id: number }).id);
     }
   }
 }
@@ -162,29 +297,4 @@ function getTypedArrayConstructor(type: BinaryType): TypedArrayCtor | null {
     default:
       return null;
   }
-}
-
-function bytesToBase64(bytes: Uint8Array): string {
-  if (typeof btoa === "undefined") {
-    throw new Error("btoa is not available in this environment.");
-  }
-  let binary = "";
-  const chunkSize = 0x8000;
-  for (let i = 0; i < bytes.length; i += chunkSize) {
-    const slice = bytes.subarray(i, i + chunkSize);
-    binary += String.fromCharCode(...slice);
-  }
-  return btoa(binary);
-}
-
-function base64ToBytes(base64: string): Uint8Array {
-  if (typeof atob === "undefined") {
-    throw new Error("atob is not available in this environment.");
-  }
-  const binary = atob(base64);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i += 1) {
-    bytes[i] = binary.charCodeAt(i);
-  }
-  return bytes;
 }
