@@ -1,4 +1,4 @@
-import type { BinaryType } from "./envelope";
+import type { BinaryType } from "./envelope.js";
 
 const TAG = "$xferkit";
 
@@ -59,22 +59,35 @@ function reviver(_key: string, value: unknown): unknown {
     return value;
   }
 
-  switch (tagged[TAG]) {
+  const tag = (tagged as any)[TAG] as TaggedValue[typeof TAG];
+  switch (tag) {
     case "ArrayBuffer": {
-      const bytes = base64ToBytes(tagged.data);
+      const payload = tagged as { [TAG]: "ArrayBuffer"; data: string };
+      const bytes = base64ToBytes(payload.data);
       return bytes.buffer;
     }
-    case "Date":
-      return new Date(tagged.value);
-    case "Map":
-      return new Map(tagged.entries);
-    case "Set":
-      return new Set(tagged.values);
+    case "Date": {
+      const payload = tagged as { [TAG]: "Date"; value: string };
+      return new Date(payload.value);
+    }
+    case "Map": {
+      const payload = tagged as { [TAG]: "Map"; entries: [unknown, unknown][] };
+      return new Map(payload.entries);
+    }
+    case "Set": {
+      const payload = tagged as { [TAG]: "Set"; values: unknown[] };
+      return new Set(payload.values);
+    }
     case "BigInt":
-      return BigInt(tagged.value);
+      if (typeof BigInt === "undefined") {
+        const payload = tagged as { [TAG]: "BigInt"; value: string };
+        return payload.value;
+      }
+      return BigInt((tagged as { [TAG]: "BigInt"; value: string }).value);
     default: {
-      const type = tagged[TAG];
-      const bytes = base64ToBytes(tagged.data);
+      const payload = tagged as { [TAG]: BinaryType; data: string };
+      const type = payload[TAG];
+      const bytes = base64ToBytes(payload.data);
       return buildTypedView(type, bytes);
     }
   }

@@ -1,4 +1,4 @@
-import type { XferTarget } from "./types";
+import type { XferTarget } from "./types.js";
 
 export function postMessageTarget(
   target: XferTarget,
@@ -39,6 +39,6 @@ function isBroadcastChannel(target: XferTarget): target is BroadcastChannel {
   );
 }
 
-function isWindowTarget(target: XferTarget): target is Window {
+function isWindowTarget(target: XferTarget): boolean {
   return typeof Window !== "undefined" && target instanceof Window;
 }

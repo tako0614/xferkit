@@ -1,6 +1,12 @@
-import type { BinaryType, PayloadFormat } from "./envelope";
-import type { CompressAlgo, EncryptAlgo, XferCodecOptions } from "./types";
-import { parseWithTags, stringifyWithTags } from "./serializer";
+import type { BinaryType, PayloadFormat } from "./envelope.js";
+import type {
+  CompressAlgo,
+  EncryptAlgo,
+  XferCodecOptions,
+  XferEncryptOptions,
+  XferKeyring,
+} from "./types.js";
+import { parseWithTags, stringifyWithTags } from "./serializer.js";
 
 export type BinaryPayload = {
   bytes: Uint8Array;
@@ -10,6 +16,17 @@ export type BinaryPayload = {
 
 export function encodeBinaryPayload(data: unknown): BinaryPayload {
   if (data instanceof ArrayBuffer) {
+    return {
+      bytes: new Uint8Array(data),
+      format: "bin",
+      binType: "ArrayBuffer",
+    };
+  }
+
+  if (
+    typeof SharedArrayBuffer !== "undefined" &&
+    data instanceof SharedArrayBuffer
+  ) {
     return {
       bytes: new Uint8Array(data),
       format: "bin",
@@ -57,14 +74,26 @@ export async function applyCodecEncode(
   let output = bytes;
   let codecInfo: CodecInfo | undefined;
   if (codec?.compress) {
-    output = await compressBytes(codec.compress.algo, output);
-    codecInfo = { ...codecInfo, compress: codec.compress.algo };
+    const compressed = await compressBytes(
+      codec.compress.algo,
+      output,
+      codec.compress.fallback
+    );
+    if (compressed.applied) {
+      output = compressed.bytes;
+      codecInfo = { ...codecInfo, compress: codec.compress.algo };
+    }
   }
 
   if (codec?.encrypt) {
-    const encrypted = await encryptBytes(output, codec.encrypt);
+    const resolved = resolveEncryptOptions(codec.encrypt);
+    const encrypted = await encryptBytes(output, resolved);
     output = encrypted.bytes;
-    codecInfo = { ...codecInfo, encrypt: codec.encrypt.algo };
+    codecInfo = {
+      ...codecInfo,
+      encrypt: codec.encrypt.algo,
+      keyId: resolved.keyId,
+    };
     return { bytes: output, iv: encrypted.iv, codec: codecInfo };
   }
 
@@ -79,7 +108,7 @@ export async function applyCodecDecode(
 ): Promise<Uint8Array> {
   let output = bytes;
   if (codecInfo?.encrypt) {
-    const key = codecOptions?.encrypt?.key;
+    const key = resolveDecryptKey(codecOptions?.encrypt, codecInfo.keyId);
     if (!key) {
       throw new Error("Missing decryption key for encrypted payload.");
     }
@@ -99,6 +128,7 @@ export async function applyCodecDecode(
 export type CodecInfo = {
   compress?: CompressAlgo;
   encrypt?: EncryptAlgo;
+  keyId?: string;
 };
 
 function reviveBinaryView(buffer: ArrayBuffer, binType: BinaryType): ArrayBufferView {
@@ -164,19 +194,23 @@ function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
 
 async function compressBytes(
   algo: CompressAlgo,
-  bytes: Uint8Array
-): Promise<Uint8Array> {
+  bytes: Uint8Array,
+  fallback?: "error" | "skip"
+): Promise<{ bytes: Uint8Array; applied: boolean }> {
   const CompressionStreamCtor = (globalThis as any).CompressionStream as
     | (new (format: string) => { readable: ReadableStream<Uint8Array> })
     | undefined;
   if (!CompressionStreamCtor) {
+    if (fallback === "skip") {
+      return { bytes, applied: false };
+    }
     throw new Error("CompressionStream is not available in this environment.");
   }
 
   const stream = new Blob([bytes]).stream().pipeThrough(
-    new CompressionStreamCtor(algo)
-  );
-  return streamToUint8Array(stream);
+    new (CompressionStreamCtor as any)(algo) as any
+  ) as ReadableStream<Uint8Array>;
+  return { bytes: await streamToUint8Array(stream), applied: true };
 }
 
 async function decompressBytes(
@@ -193,14 +227,14 @@ async function decompressBytes(
   }
 
   const stream = new Blob([bytes]).stream().pipeThrough(
-    new DecompressionStreamCtor(algo)
-  );
+    new (DecompressionStreamCtor as any)(algo) as any
+  ) as ReadableStream<Uint8Array>;
   return streamToUint8Array(stream);
 }
 
 async function encryptBytes(
   bytes: Uint8Array,
-  options: { algo: EncryptAlgo; key: CryptoKey; ivLength?: number }
+  options: { algo: EncryptAlgo; key: CryptoKey; keyId?: string; ivLength?: number }
 ): Promise<{ bytes: Uint8Array; iv: Uint8Array }> {
   if (options.algo !== "aes-gcm") {
     throw new Error(`Unsupported encryption algorithm: ${options.algo}`);
@@ -239,6 +273,68 @@ async function decryptBytes(
     bytes
   );
   return new Uint8Array(decrypted);
+}
+
+function resolveEncryptOptions(
+  options: XferEncryptOptions
+): { algo: EncryptAlgo; key: CryptoKey; keyId?: string; ivLength?: number } {
+  const keyInfo = normalizeKey(options.key, options.keyId, true);
+  return {
+    algo: options.algo,
+    key: keyInfo.key,
+    keyId: keyInfo.keyId,
+    ivLength: options.ivLength,
+  };
+}
+
+function resolveDecryptKey(
+  options: XferEncryptOptions | undefined,
+  keyId: string | undefined
+): CryptoKey | null {
+  if (!options) {
+    return null;
+  }
+  if (isKeyring(options.key)) {
+    const ring = options.key;
+    const effectiveId = keyId ?? options.keyId;
+    if (effectiveId) {
+      if (ring.keys && ring.keys[effectiveId]) {
+        return ring.keys[effectiveId];
+      }
+      if (ring.currentId === effectiveId) {
+        return ring.current;
+      }
+      return null;
+    }
+    return ring.current;
+  }
+  return options.key;
+}
+
+function normalizeKey(
+  key: CryptoKey | XferKeyring,
+  keyId: string | undefined,
+  strict: boolean
+): { key: CryptoKey; keyId?: string } {
+  if (isKeyring(key)) {
+    if (keyId) {
+      if (key.keys && key.keys[keyId]) {
+        return { key: key.keys[keyId], keyId };
+      }
+      if (key.currentId === keyId) {
+        return { key: key.current, keyId };
+      }
+      if (strict) {
+        throw new Error(`Missing key for keyId: ${keyId}`);
+      }
+    }
+    return { key: key.current, keyId: key.currentId ?? keyId };
+  }
+  return { key, keyId };
+}
+
+function isKeyring(value: CryptoKey | XferKeyring): value is XferKeyring {
+  return typeof (value as XferKeyring).current !== "undefined";
 }
 
 async function streamToUint8Array(

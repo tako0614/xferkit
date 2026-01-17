@@ -1,4 +1,4 @@
-import type { CompressAlgo, EncryptAlgo } from "./types";
+import type { CompressAlgo, EncryptAlgo } from "./types.js";
 
 export const XFERKIT_VERSION = 1 as const;
 
@@ -27,18 +27,27 @@ export type DataFrame = {
   kind: "data";
   channel: string;
   id: string;
+  seq?: number;
   mode: "structured" | "binary";
   ack?: 1;
+  ackMode?: "message" | "chunk";
   payload: unknown;
   part?: {
     index: number;
     total: number;
+  };
+  stream?: {
+    id: string;
+    seq: number;
+    done?: 1;
+    meta?: unknown;
   };
   format?: PayloadFormat;
   binType?: BinaryType;
   codec?: {
     compress?: CompressAlgo;
     encrypt?: EncryptAlgo;
+    keyId?: string;
   };
   iv?: ArrayBuffer;
 };
@@ -49,6 +58,14 @@ export type AckFrame = {
   kind: "ack";
   channel: string;
   id: string;
+  part?: {
+    index: number;
+    total: number;
+  };
+  stream?: {
+    id: string;
+    seq: number;
+  };
 };
 
 export type NackFrame = {
@@ -58,6 +75,14 @@ export type NackFrame = {
   channel: string;
   id: string;
   reason?: string;
+  part?: {
+    index: number;
+    total: number;
+  };
+  stream?: {
+    id: string;
+    seq: number;
+  };
 };
 
 export function isFrame(value: unknown): value is Frame {
