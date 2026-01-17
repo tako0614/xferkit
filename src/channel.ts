@@ -372,8 +372,8 @@ export function createXfer(target: XferTarget, options: XferOptions = {}): Xfer 
       ackTimeoutMs,
       sendOptions?.signal
     );
-    await waitForSlot(requireAck, sendOptions?.signal);
-    dispatchMessage(message);
+    const reserved = await waitForSlot(requireAck, sendOptions?.signal);
+    dispatchMessage(message, reserved);
     return message.deferred.promise;
   };
 
@@ -397,10 +397,7 @@ export function createXfer(target: XferTarget, options: XferOptions = {}): Xfer 
       sendOptions?.timeoutMs ?? reliability.ackTimeoutMs ?? 2500,
       50
     );
-    await waitForSlot(requireAck, sendOptions?.signal);
-    if (requireAck) {
-      inFlight += 1;
-    }
+    const reserved = await waitForSlot(requireAck, sendOptions?.signal);
     try {
       await sendStreamInternal(stream, {
         requireAck,
@@ -411,7 +408,7 @@ export function createXfer(target: XferTarget, options: XferOptions = {}): Xfer 
         resumeKey: sendOptions?.resumeKey,
       });
     } finally {
-      if (requireAck) {
+      if (reserved) {
         inFlight -= 1;
         releaseSlot();
       }
@@ -665,26 +662,33 @@ export function createXfer(target: XferTarget, options: XferOptions = {}): Xfer 
     }
   };
 
-  const waitForSlot = async (requireAck: boolean, signal?: AbortSignal) => {
+  const waitForSlot = async (
+    requireAck: boolean,
+    signal?: AbortSignal
+  ): Promise<boolean> => {
     if (!requireAck) {
-      return;
+      return false;
     }
-    if (inFlight < (reliability.maxInFlight ?? 16)) {
-      return;
-    }
-    if (signal?.aborted) {
-      throw new DOMException("Aborted", "AbortError");
-    }
-    const waiter = createDeferred<void>();
-    slotWaiters.push(waiter);
-    const onAbort = () => {
-      waiter.reject(new DOMException("Aborted", "AbortError"));
-    };
-    signal?.addEventListener("abort", onAbort, { once: true });
-    try {
-      await waiter.promise;
-    } finally {
-      signal?.removeEventListener("abort", onAbort);
+    const maxInFlight = reliability.maxInFlight ?? 16;
+    while (true) {
+      if (inFlight < maxInFlight) {
+        inFlight += 1;
+        return true;
+      }
+      if (signal?.aborted) {
+        throw new DOMException("Aborted", "AbortError");
+      }
+      const waiter = createDeferred<void>();
+      slotWaiters.push(waiter);
+      const onAbort = () => {
+        waiter.reject(new DOMException("Aborted", "AbortError"));
+      };
+      signal?.addEventListener("abort", onAbort, { once: true });
+      try {
+        await waiter.promise;
+      } finally {
+        signal?.removeEventListener("abort", onAbort);
+      }
     }
   };
 
@@ -696,13 +700,19 @@ export function createXfer(target: XferTarget, options: XferOptions = {}): Xfer 
     waiter?.resolve();
   };
 
-  const dispatchMessage = (message: OutboundMessage) => {
+  const dispatchMessage = (message: OutboundMessage, reserved = false) => {
     if (closed) {
       message.deferred.reject(new Error("xferkit channel closed."));
+      if (reserved && message.requireAck) {
+        inFlight -= 1;
+        releaseSlot();
+      }
       return;
     }
     if (message.requireAck) {
-      inFlight += 1;
+      if (!reserved) {
+        inFlight += 1;
+      }
       pending.set(message.id, message);
       attachAbort(message);
       if (message.persisted) {
@@ -1158,6 +1168,14 @@ export function createXfer(target: XferTarget, options: XferOptions = {}): Xfer 
       }
     }
     let splitOccurred = false;
+    const updateOffset = (delta: number) => {
+      offsetBytes += delta;
+      if (streamState) {
+        streamState.offsetBytes = offsetBytes;
+        streamState.lastActivity = nowMs();
+        requestSessionSave();
+      }
+    };
     const windowSize = Math.max(1, reliability.chunkWindowSize ?? 8);
     const inFlight = new Set<Promise<void>>();
     const schedule = async (promise: Promise<void>) => {
@@ -1200,20 +1218,23 @@ export function createXfer(target: XferTarget, options: XferOptions = {}): Xfer 
         if (!value || value.byteLength === 0) {
           continue;
         }
-        offsetBytes += value.byteLength;
-        if (streamState) {
-          streamState.offsetBytes = offsetBytes;
-          streamState.lastActivity = nowMs();
-          requestSessionSave();
-        }
         const chunks = chunkBytes(value, sendOptions.chunkBytes);
         if (chunks.length > 1) {
           splitOccurred = true;
         }
         for (const chunk of chunks) {
+          const chunkSize = chunk.byteLength;
           const meta = !metaSent ? sendOptions.meta : undefined;
           await schedule(
-            sendStreamChunk(streamId, seq, chunk, false, meta, sendOptions)
+            sendStreamChunk(
+              streamId,
+              seq,
+              chunk,
+              false,
+              meta,
+              sendOptions,
+              () => updateOffset(chunkSize)
+            )
           );
           metaSent = true;
           seq += 1;
@@ -1256,7 +1277,8 @@ export function createXfer(target: XferTarget, options: XferOptions = {}): Xfer 
       requireAck: boolean;
       ackTimeoutMs: number;
       signal?: AbortSignal;
-    }
+    },
+    onQueued?: () => void
   ) => {
     if (sendOptions.signal?.aborted) {
       throw new DOMException("Aborted", "AbortError");
@@ -1306,6 +1328,7 @@ export function createXfer(target: XferTarget, options: XferOptions = {}): Xfer 
         transferList,
         options.targetOrigin
       );
+      onQueued?.();
       return;
     }
 
@@ -1333,6 +1356,7 @@ export function createXfer(target: XferTarget, options: XferOptions = {}): Xfer 
     }
     scheduleStreamAckTimeout(state);
     postStreamChunk(state);
+    onQueued?.();
     const onAbort = () => {
       pendingStreamChunks.delete(key);
       if (state.timer) {
@@ -2717,6 +2741,7 @@ export function createXfer(target: XferTarget, options: XferOptions = {}): Xfer 
     } finally {
       restoringSession = false;
     }
+    requestSessionSave(true);
     if (resumeRequests.length > 0 && session?.streamResume) {
       const streamResume = session.streamResume;
       for (const entry of resumeRequests) {
@@ -2731,11 +2756,7 @@ export function createXfer(target: XferTarget, options: XferOptions = {}): Xfer 
             if (!stream) {
               throw new Error("Missing stream resume source.");
             }
-            if (entry.requireAck) {
-              await waitForSlot(true);
-              inFlight += 1;
-              reserved = true;
-            }
+            reserved = await waitForSlot(entry.requireAck, undefined);
             await sendStreamInternal(
               stream,
               {
