@@ -99,6 +99,11 @@ export type ControlFrame = {
   handshakeId: string;
   curve?: "P-256" | "P-384" | "P-521";
   pub?: ArrayBuffer;
+  auth?: {
+    algo: AuthAlgo;
+    keyId?: string;
+  };
+  authTag?: ArrayBuffer;
 };
 
 export function isFrame(value: unknown): value is Frame {

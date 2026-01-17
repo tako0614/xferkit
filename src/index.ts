@@ -32,6 +32,7 @@ export type {
   XferReliabilityOptions,
   XferSendOptions,
   XferSessionOptions,
+  XferStreamResumeInfo,
   XferStreamInfo,
   XferStreamSendOptions,
   XferStats,

@@ -60,6 +60,9 @@ const channel = createXfer(worker, {
 await channel.handshake();
 ```
 
+To authenticate the handshake, configure `codec.auth` on both sides. Handshake
+frames are signed with the same HMAC key.
+
 ## Session resume
 
 ```ts
@@ -68,8 +71,31 @@ const channel = createXfer(worker, {
     id: "chat-room",
     persistOutbound: true,
     persistInbound: true,
+    maxBytes: 4_000_000,
+    chunkSize: 900_000,
     ttlMs: 5 * 60_000,
   },
+});
+```
+
+`persistOutbound`/`persistInbound` apply to both messages and streams. Session
+storage is chunked and trimmed to stay within `maxBytes`.
+
+To resume outbound streams, pass a stable `resumeKey` and provide
+`session.streamResume` that returns a stream starting after the saved `offset`.
+
+```ts
+const channel = createXfer(worker, {
+  session: {
+    id: "upload",
+    persistOutbound: true,
+    streamResume: ({ key, offset }) => getFileById(key).slice(offset).stream(),
+  },
+});
+
+await channel.sendStream(file.stream(), {
+  resumeKey: file.name,
+  meta: { name: file.name },
 });
 ```
 
@@ -83,6 +109,11 @@ const channel = createXfer(worker, {
   },
 });
 ```
+
+## Examples
+
+- `examples/smoke.mjs`: basic send/receive and stream send.
+- `examples/session-resume.mjs`: session resume for messages and streams (requires build).
 
 ## Stream send/receive
 

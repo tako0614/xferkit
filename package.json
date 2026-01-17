@@ -15,6 +15,7 @@
     "dist"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.json"
+    "build": "tsc -p tsconfig.json",
+    "test": "npm run build && node examples/smoke.mjs && node examples/session-resume.mjs"
   }
 }

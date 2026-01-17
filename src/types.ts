@@ -58,6 +58,7 @@ export interface XferStreamSendOptions {
   timeoutMs?: number;
   signal?: AbortSignal;
   meta?: unknown;
+  resumeKey?: string;
 }
 
 export interface XferBackpressureOptions {
@@ -78,6 +79,18 @@ export interface XferSessionOptions {
   persistOutbound?: boolean;
   persistInbound?: boolean;
   ttlMs?: number;
+  maxBytes?: number;
+  chunkSize?: number;
+  streamResume?: (
+    info: XferStreamResumeInfo
+  ) => ReadableStream<Uint8Array> | Promise<ReadableStream<Uint8Array>> | null;
+}
+
+export interface XferStreamResumeInfo {
+  key: string;
+  // Bytes already read from the original stream.
+  offset: number;
+  streamId: string;
 }
 
 export interface XferReliabilityOptions {
