@@ -1100,6 +1100,22 @@ export function createXfer(target: XferTarget, options: XferOptions = {}): Xfer 
   };
 
   const streamChunkKey = (id: string, seq: number) => `${id}:${seq}`;
+  const getPendingStreamInfo = (streamId: string) => {
+    let maxSeq = -1;
+    let metaSent = false;
+    for (const state of pendingStreamChunks.values()) {
+      if (state.id !== streamId) {
+        continue;
+      }
+      if (state.seq > maxSeq) {
+        maxSeq = state.seq;
+      }
+      if (state.frameBase.stream?.meta !== undefined) {
+        metaSent = true;
+      }
+    }
+    return { maxSeq, metaSent };
+  };
 
   const sendStreamInternal = async (
     stream: ReadableStream<Uint8Array>,
@@ -2662,6 +2678,13 @@ export function createXfer(target: XferTarget, options: XferOptions = {}): Xfer 
       if (persistOutboundEnabled && state.outboundStreamStates) {
         for (const entry of Object.values(state.outboundStreamStates)) {
           const restored = restoreOutboundStreamState(entry);
+          const pendingInfo = getPendingStreamInfo(restored.id);
+          if (pendingInfo.maxSeq >= 0) {
+            restored.nextSeq = Math.max(restored.nextSeq, pendingInfo.maxSeq + 1);
+            if (pendingInfo.metaSent) {
+              restored.metaSent = true;
+            }
+          }
           outboundStreamStates.set(restored.id, restored);
           if (!restored.done) {
             resumeRequests.push(restored);
@@ -2695,11 +2718,12 @@ export function createXfer(target: XferTarget, options: XferOptions = {}): Xfer 
       restoringSession = false;
     }
     if (resumeRequests.length > 0 && session?.streamResume) {
+      const streamResume = session.streamResume;
       for (const entry of resumeRequests) {
         const resume = async () => {
           let reserved = false;
           try {
-            const stream = await session.streamResume({
+            const stream = await streamResume({
               key: entry.resumeKey ?? entry.id,
               offset: entry.offsetBytes,
               streamId: entry.id,
