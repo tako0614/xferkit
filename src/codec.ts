@@ -45,11 +45,37 @@ export function encodeBinaryPayload(data: unknown): BinaryPayload {
     };
   }
 
-  const json = stringifyWithTags(data);
-  return {
-    bytes: new TextEncoder().encode(json),
-    format: "json",
+  try {
+    const json = stringifyWithTags(data);
+    return {
+      bytes: new TextEncoder().encode(json),
+      format: "json",
+    };
+  } catch (err) {
+    throw new Error(
+      `Failed to encode payload: ${err instanceof Error ? err.message : String(err)}`
+    );
+  }
+}
+
+// Type definitions for CompressionStream and DecompressionStream
+interface CompressionStreamConstructor {
+  new (format: string): {
+    readable: ReadableStream<Uint8Array>;
+    writable: WritableStream<Uint8Array>;
   };
+}
+
+interface DecompressionStreamConstructor {
+  new (format: string): {
+    readable: ReadableStream<Uint8Array>;
+    writable: WritableStream<Uint8Array>;
+  };
+}
+
+interface GlobalWithCompression {
+  CompressionStream?: CompressionStreamConstructor;
+  DecompressionStream?: DecompressionStreamConstructor;
 }
 
 export function decodeBinaryPayload(
@@ -65,8 +91,14 @@ export function decodeBinaryPayload(
     return buffer;
   }
 
-  const text = new TextDecoder().decode(bytes);
-  return parseWithTags(text);
+  try {
+    const text = new TextDecoder().decode(bytes);
+    return parseWithTags(text);
+  } catch (err) {
+    throw new Error(
+      `Failed to decode payload: ${err instanceof Error ? err.message : String(err)}`
+    );
+  }
 }
 
 export async function applyCodecEncode(
@@ -251,9 +283,9 @@ async function compressBytes(
   bytes: Uint8Array,
   fallback?: "error" | "skip"
 ): Promise<{ bytes: Uint8Array; applied: boolean }> {
-  const CompressionStreamCtor = (globalThis as any).CompressionStream as
-    | (new (format: string) => { readable: ReadableStream<Uint8Array> })
-    | undefined;
+  const global_ = globalThis as GlobalWithCompression;
+  const CompressionStreamCtor = global_.CompressionStream;
+
   if (!CompressionStreamCtor) {
     if (fallback === "skip") {
       return { bytes, applied: false };
@@ -261,29 +293,43 @@ async function compressBytes(
     throw new Error("CompressionStream is not available in this environment.");
   }
 
-  const stream = new Blob([bytes]).stream().pipeThrough(
-    new (CompressionStreamCtor as any)(algo) as any
-  ) as ReadableStream<Uint8Array>;
-  return { bytes: await streamToUint8Array(stream), applied: true };
+  try {
+    const stream = new Blob([bytes])
+      .stream()
+      .pipeThrough(new CompressionStreamCtor(algo));
+
+    return { bytes: await streamToUint8Array(stream), applied: true };
+  } catch (err) {
+    throw new Error(
+      `Compression failed: ${err instanceof Error ? err.message : String(err)}`
+    );
+  }
 }
 
 async function decompressBytes(
   algo: CompressAlgo,
   bytes: Uint8Array
 ): Promise<Uint8Array> {
-  const DecompressionStreamCtor = (globalThis as any).DecompressionStream as
-    | (new (format: string) => { readable: ReadableStream<Uint8Array> })
-    | undefined;
+  const global_ = globalThis as GlobalWithCompression;
+  const DecompressionStreamCtor = global_.DecompressionStream;
+
   if (!DecompressionStreamCtor) {
     throw new Error(
       "DecompressionStream is not available in this environment."
     );
   }
 
-  const stream = new Blob([bytes]).stream().pipeThrough(
-    new (DecompressionStreamCtor as any)(algo) as any
-  ) as ReadableStream<Uint8Array>;
-  return streamToUint8Array(stream);
+  try {
+    const stream = new Blob([bytes])
+      .stream()
+      .pipeThrough(new DecompressionStreamCtor(algo));
+
+    return streamToUint8Array(stream);
+  } catch (err) {
+    throw new Error(
+      `Decompression failed: ${err instanceof Error ? err.message : String(err)}`
+    );
+  }
 }
 
 async function encryptBytes(
@@ -388,7 +434,11 @@ function resolveDecryptKey(
     const effectiveId = keyId ?? options.keyId;
     if (effectiveId) {
       if (ring.keys && ring.keys[effectiveId]) {
-        return ring.keys[effectiveId];
+        const key = ring.keys[effectiveId];
+        if (key && typeof key === "object" && key instanceof CryptoKey) {
+          return key;
+        }
+        return null;
       }
       if (ring.currentId === effectiveId) {
         return ring.current;
@@ -412,7 +462,11 @@ function resolveAuthKey(
     const effectiveId = keyId ?? options.keyId;
     if (effectiveId) {
       if (ring.keys && ring.keys[effectiveId]) {
-        return ring.keys[effectiveId];
+        const key = ring.keys[effectiveId];
+        if (key && typeof key === "object" && key instanceof CryptoKey) {
+          return key;
+        }
+        return null;
       }
       if (ring.currentId === effectiveId) {
         return ring.current;
@@ -447,7 +501,12 @@ function normalizeKey(
 }
 
 function isKeyring(value: CryptoKey | XferKeyring): value is XferKeyring {
-  return typeof (value as XferKeyring).current !== "undefined";
+  return (
+    value !== null &&
+    typeof value === "object" &&
+    "current" in value &&
+    typeof value.current !== "undefined"
+  );
 }
 
 async function streamToUint8Array(
@@ -456,19 +515,27 @@ async function streamToUint8Array(
   const reader = stream.getReader();
   const chunks: Uint8Array[] = [];
   let total = 0;
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) {
-      break;
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) {
+        break;
+      }
+      chunks.push(value);
+      total += value.byteLength;
     }
-    chunks.push(value);
-    total += value.byteLength;
+    const merged = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) {
+      merged.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    return merged;
+  } catch (err) {
+    throw new Error(
+      `Stream reading failed: ${err instanceof Error ? err.message : String(err)}`
+    );
+  } finally {
+    reader.releaseLock();
   }
-  const merged = new Uint8Array(total);
-  let offset = 0;
-  for (const chunk of chunks) {
-    merged.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  return merged;
 }

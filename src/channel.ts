@@ -339,7 +339,9 @@ export function createXfer(target: XferTarget, options: XferOptions = {}): Xfer 
   let closed = false;
 
   const onMessage = (event: MessageEvent) => {
-    void handleIncoming(event.data);
+    handleIncoming(event.data).catch((err) => {
+      emit("error", err);
+    });
   };
 
   const onError = (event: MessageEvent) => {
@@ -520,7 +522,17 @@ export function createXfer(target: XferTarget, options: XferOptions = {}): Xfer 
         handler(payload);
       } catch (err) {
         if (event !== "error") {
-          listeners.error.forEach((fn) => fn(err));
+          for (const errorHandler of listeners.error) {
+            try {
+              errorHandler(err);
+            } catch {
+              // Prevent recursive error handling
+              console.error("xferkit: error handler threw an error", err);
+            }
+          }
+        } else {
+          // Error handler threw an error
+          console.error("xferkit: error handler threw an error", err);
         }
       }
     }
@@ -701,7 +713,17 @@ export function createXfer(target: XferTarget, options: XferOptions = {}): Xfer 
         }
         waiter.reject(new DOMException("Aborted", "AbortError"));
       };
-      signal?.addEventListener("abort", onAbort, { once: true });
+      if (signal) {
+        signal.addEventListener("abort", onAbort, { once: true });
+        if (signal.aborted) {
+          signal.removeEventListener("abort", onAbort);
+          const index = slotWaiters.indexOf(waiter);
+          if (index >= 0) {
+            slotWaiters.splice(index, 1);
+          }
+          throw new DOMException("Aborted", "AbortError");
+        }
+      }
       try {
         await waiter.promise;
       } finally {
@@ -900,10 +922,14 @@ export function createXfer(target: XferTarget, options: XferOptions = {}): Xfer 
   };
 
   const completeMessage = (message: OutboundMessage) => {
+    if (!pending.has(message.id)) {
+      return;
+    }
     pending.delete(message.id);
     detachAbort(message);
     if (message.timer) {
       clearTimeout(message.timer);
+      message.timer = undefined;
     }
     inFlight -= 1;
     emitStatus({ type: "ack", id: message.id });
@@ -1043,8 +1069,10 @@ export function createXfer(target: XferTarget, options: XferOptions = {}): Xfer 
         return;
       }
       pending.delete(message.id);
+      message.abortHandler = undefined;
       if (message.timer) {
         clearTimeout(message.timer);
+        message.timer = undefined;
       }
       inFlight -= 1;
       stats.droppedMessages += 1;
@@ -1158,54 +1186,54 @@ export function createXfer(target: XferTarget, options: XferOptions = {}): Xfer 
     resumeState?: OutboundStreamState
   ) => {
     const reader = stream.getReader();
-    const streamId = resumeState?.id ?? createId("stream");
-    let seq = resumeState?.nextSeq ?? 0;
-    let metaSent = resumeState?.metaSent ?? false;
-    let offsetBytes = resumeState?.offsetBytes ?? 0;
-    let streamState = resumeState;
-    const resumeKey = sendOptions.resumeKey ?? resumeState?.resumeKey;
-    if (persistOutboundEnabled && resumeKey) {
-      if (!streamState) {
-        streamState = {
-          id: streamId,
-          resumeKey,
-          offsetBytes,
-          nextSeq: seq,
-          metaSent,
-          meta: sendOptions.meta,
-          chunkBytes: sendOptions.chunkBytes,
-          requireAck: sendOptions.requireAck,
-          ackTimeoutMs: sendOptions.ackTimeoutMs,
-          done: false,
-          lastActivity: nowMs(),
-        };
-        outboundStreamStates.set(streamId, streamState);
-        requestSessionSave(true);
-      } else {
-        streamState.resumeKey = resumeKey;
-      }
-    }
     let splitOccurred = false;
-    const updateOffset = (delta: number) => {
-      offsetBytes += delta;
-      if (streamState) {
-        streamState.offsetBytes = offsetBytes;
-        streamState.lastActivity = nowMs();
-      }
-    };
-    const windowSize = Math.max(1, reliability.chunkWindowSize ?? 8);
     const inFlight = new Set<Promise<void>>();
-    const schedule = async (promise: Promise<void>) => {
-      const guarded = promise.catch((err) => {
-        throw err;
-      });
-      inFlight.add(guarded);
-      guarded.finally(() => inFlight.delete(guarded));
-      if (inFlight.size >= windowSize) {
-        await Promise.race(inFlight);
-      }
-    };
     try {
+      const streamId = resumeState?.id ?? createId("stream");
+      let seq = resumeState?.nextSeq ?? 0;
+      let metaSent = resumeState?.metaSent ?? false;
+      let offsetBytes = resumeState?.offsetBytes ?? 0;
+      let streamState = resumeState;
+      const resumeKey = sendOptions.resumeKey ?? resumeState?.resumeKey;
+      if (persistOutboundEnabled && resumeKey) {
+        if (!streamState) {
+          streamState = {
+            id: streamId,
+            resumeKey,
+            offsetBytes,
+            nextSeq: seq,
+            metaSent,
+            meta: sendOptions.meta,
+            chunkBytes: sendOptions.chunkBytes,
+            requireAck: sendOptions.requireAck,
+            ackTimeoutMs: sendOptions.ackTimeoutMs,
+            done: false,
+            lastActivity: nowMs(),
+          };
+          outboundStreamStates.set(streamId, streamState);
+          requestSessionSave(true);
+        } else {
+          streamState.resumeKey = resumeKey;
+        }
+      }
+      const updateOffset = (delta: number) => {
+        offsetBytes += delta;
+        if (streamState) {
+          streamState.offsetBytes = offsetBytes;
+          streamState.lastActivity = nowMs();
+        }
+      };
+      const windowSize = Math.max(1, reliability.chunkWindowSize ?? 8);
+      const schedule = async (promise: Promise<void>) => {
+        const guarded = promise.catch((err) => {
+          throw err;
+        });
+        inFlight.add(guarded);
+        guarded.finally(() => inFlight.delete(guarded));
+        if (inFlight.size >= windowSize) {
+          await Promise.race(inFlight);
+        }
+      };
       while (true) {
         if (sendOptions.signal?.aborted) {
           throw new DOMException("Aborted", "AbortError");
@@ -1367,7 +1395,6 @@ export function createXfer(target: XferTarget, options: XferOptions = {}): Xfer 
       lastActivity: nowMs(),
       deferred: createDeferred<void>(),
     };
-    state.deferred.promise.catch(() => {});
 
     const key = streamChunkKey(streamId, seq);
     pendingStreamChunks.set(key, state);
@@ -1444,6 +1471,10 @@ export function createXfer(target: XferTarget, options: XferOptions = {}): Xfer 
     state.attempt += 1;
     stats.resentMessages += 1;
     const delay = state.backoffMs * Math.max(1, state.attempt);
+    if (state.timer) {
+      clearTimeout(state.timer);
+      state.timer = undefined;
+    }
     setTimeout(() => {
       postStreamChunk(state);
       scheduleStreamAckTimeout(state);
@@ -1805,7 +1836,10 @@ export function createXfer(target: XferTarget, options: XferOptions = {}): Xfer 
         if (persistInboundEnabled) {
           requestSessionSave();
         }
-        const merged = mergeChunks(entry.chunks.filter(Boolean) as Uint8Array[]);
+        const filteredChunks = entry.chunks.filter((chunk): chunk is Uint8Array => {
+          return chunk !== null && chunk !== undefined && chunk instanceof Uint8Array;
+        });
+        const merged = mergeChunks(filteredChunks);
         const decoded = await decodePayload(
           {
             ...frame,
@@ -1927,10 +1961,12 @@ export function createXfer(target: XferTarget, options: XferOptions = {}): Xfer 
     }
     for (const [id, entry] of streams.entries()) {
       if (entry.updatedAt < cutoff) {
-        try {
-          entry.controller.error(new Error("xferkit stream timeout"));
-        } catch {
-          // ignore
+        if (entry.controller.desiredSize !== null) {
+          try {
+            entry.controller.error(new Error("xferkit stream timeout"));
+          } catch {
+            // Controller may have been closed/errored between the check and the call
+          }
         }
         streams.delete(id);
         recentStreams.set(id, nowMs());
@@ -2046,7 +2082,9 @@ export function createXfer(target: XferTarget, options: XferOptions = {}): Xfer 
         clearTimeout(sessionSaveTimer);
         sessionSaveTimer = null;
       }
-      void saveSessionState(true);
+      saveSessionState(true).catch((err) => {
+        emit("error", err);
+      });
       return;
     }
     if (sessionSaveTimer) {
@@ -2054,7 +2092,9 @@ export function createXfer(target: XferTarget, options: XferOptions = {}): Xfer 
     }
     sessionSaveTimer = setTimeout(() => {
       sessionSaveTimer = null;
-      void saveSessionState(false);
+      saveSessionState(false).catch((err) => {
+        emit("error", err);
+      });
     }, 50);
   };
 
@@ -2083,12 +2123,18 @@ export function createXfer(target: XferTarget, options: XferOptions = {}): Xfer 
   const serializeFrameSpec = (spec: OutboundFrameSpec): PersistedFrame => {
     const base = serializeFrameBase(spec.base);
     if (spec.mode === "structured") {
-      return {
-        base,
-        payload: stringifyWithTags(spec.payload),
-        transferEnabled: spec.transferEnabled,
-        partIndex: spec.partIndex,
-      };
+      try {
+        return {
+          base,
+          payload: stringifyWithTags(spec.payload),
+          transferEnabled: spec.transferEnabled,
+          partIndex: spec.partIndex,
+        };
+      } catch (err) {
+        throw new Error(
+          `Failed to serialize frame payload: ${err instanceof Error ? err.message : String(err)}`
+        );
+      }
     }
     return {
       base,
@@ -2104,13 +2150,19 @@ export function createXfer(target: XferTarget, options: XferOptions = {}): Xfer 
   ): OutboundFrameSpec => {
     const base = restoreFrameBase(frame.base);
     if (base.mode === "structured") {
-      return {
-        base,
-        mode: "structured",
-        payload: parseWithTags(frame.payload),
-        transferEnabled,
-        partIndex: frame.partIndex,
-      };
+      try {
+        return {
+          base,
+          mode: "structured",
+          payload: parseWithTags(frame.payload),
+          transferEnabled,
+          partIndex: frame.partIndex,
+        };
+      } catch (err) {
+        throw new Error(
+          `Failed to restore frame payload: ${err instanceof Error ? err.message : String(err)}`
+        );
+      }
     }
     return {
       base,
@@ -2241,13 +2293,24 @@ export function createXfer(target: XferTarget, options: XferOptions = {}): Xfer 
   const restoreOutboundStreamState = (
     state: PersistedOutboundStreamState
   ): OutboundStreamState => {
+    let meta: unknown = undefined;
+    if (state.meta !== undefined) {
+      try {
+        meta = parseWithTags(state.meta);
+      } catch (err) {
+        emit("error", new Error(
+          `Failed to restore stream meta: ${err instanceof Error ? err.message : String(err)}`
+        ));
+        meta = undefined;
+      }
+    }
     return {
       id: state.id,
       resumeKey: state.resumeKey,
       offsetBytes: state.offsetBytes,
       nextSeq: state.nextSeq,
       metaSent: state.metaSent,
-      meta: state.meta !== undefined ? parseWithTags(state.meta) : undefined,
+      meta,
       chunkBytes: state.chunkBytes,
       requireAck: state.requireAck,
       ackTimeoutMs: state.ackTimeoutMs,
@@ -2282,16 +2345,36 @@ export function createXfer(target: XferTarget, options: XferOptions = {}): Xfer 
           const count = parsed?.count ?? 0;
           if (Number.isFinite(count)) {
             for (let i = 0; i < count; i += 1) {
-              storage.removeItem(`${sessionChunkPrefix}${i}`);
+              try {
+                storage.removeItem(`${sessionChunkPrefix}${i}`);
+              } catch (err) {
+                emit("error", new Error(
+                  `Failed to remove session chunk ${i}: ${err instanceof Error ? err.message : String(err)}`
+                ));
+              }
             }
           }
-        } catch {
-          // ignore malformed index
+        } catch (err) {
+          emit("error", new Error(
+            `Failed to parse session index: ${err instanceof Error ? err.message : String(err)}`
+          ));
         }
-        storage.removeItem(sessionIndexKey);
+        try {
+          storage.removeItem(sessionIndexKey);
+        } catch (err) {
+          emit("error", new Error(
+            `Failed to remove session index: ${err instanceof Error ? err.message : String(err)}`
+          ));
+        }
       }
     }
-    storage.removeItem(sessionStorageKey);
+    try {
+      storage.removeItem(sessionStorageKey);
+    } catch (err) {
+      emit("error", new Error(
+        `Failed to remove session storage: ${err instanceof Error ? err.message : String(err)}`
+      ));
+    }
   };
 
   const readSessionString = (): string | null => {
@@ -2331,21 +2414,52 @@ export function createXfer(target: XferTarget, options: XferOptions = {}): Xfer 
     clearSessionStorage();
     const chunkSize = session?.chunkSize ?? 900_000;
     if (!sessionChunkPrefix || !sessionIndexKey || chunkSize <= 0) {
-      storage.setItem(sessionStorageKey, value);
+      try {
+        storage.setItem(sessionStorageKey, value);
+      } catch (err) {
+        if (err instanceof Error && err.name === "QuotaExceededError") {
+          emit("error", new Error("Session storage quota exceeded"));
+        } else {
+          emit("error", new Error(
+            `Failed to save session: ${err instanceof Error ? err.message : String(err)}`
+          ));
+        }
+      }
       return;
     }
     if (value.length <= chunkSize) {
-      storage.setItem(sessionStorageKey, value);
+      try {
+        storage.setItem(sessionStorageKey, value);
+      } catch (err) {
+        if (err instanceof Error && err.name === "QuotaExceededError") {
+          emit("error", new Error("Session storage quota exceeded"));
+        } else {
+          emit("error", new Error(
+            `Failed to save session: ${err instanceof Error ? err.message : String(err)}`
+          ));
+        }
+      }
       return;
     }
     const chunks: string[] = [];
     for (let i = 0; i < value.length; i += chunkSize) {
       chunks.push(value.slice(i, i + chunkSize));
     }
-    for (let i = 0; i < chunks.length; i += 1) {
-      storage.setItem(`${sessionChunkPrefix}${i}`, chunks[i]);
+    try {
+      for (let i = 0; i < chunks.length; i += 1) {
+        storage.setItem(`${sessionChunkPrefix}${i}`, chunks[i]);
+      }
+      storage.setItem(sessionIndexKey, JSON.stringify({ count: chunks.length }));
+    } catch (err) {
+      if (err instanceof Error && err.name === "QuotaExceededError") {
+        emit("error", new Error("Session storage quota exceeded"));
+        clearSessionStorage();
+      } else {
+        emit("error", new Error(
+          `Failed to save session chunks: ${err instanceof Error ? err.message : String(err)}`
+        ));
+      }
     }
-    storage.setItem(sessionIndexKey, JSON.stringify({ count: chunks.length }));
   };
 
   const serializeSessionState = (
@@ -2568,7 +2682,9 @@ export function createXfer(target: XferTarget, options: XferOptions = {}): Xfer 
       sessionSaveInFlight = false;
       if (sessionSaveQueued) {
         sessionSaveQueued = false;
-        void saveSessionState(false);
+        saveSessionState(false).catch((err) => {
+          emit("error", err);
+        });
       }
     }
   };
@@ -2581,35 +2697,48 @@ export function createXfer(target: XferTarget, options: XferOptions = {}): Xfer 
     if (!raw) {
       return null;
     }
-    let parsed: PersistedSession | null = null;
+    let parsed: unknown;
     try {
-      parsed = JSON.parse(raw) as PersistedSession;
-    } catch {
+      parsed = JSON.parse(raw);
+    } catch (err) {
+      emit("error", new Error(
+        `Failed to parse session state: ${err instanceof Error ? err.message : String(err)}`
+      ));
       clearSessionStorage();
       return null;
     }
-    if (!parsed || parsed.version !== 1) {
-      clearSessionStorage();
-      return null;
-    }
+
+    // Validate parsed data
     if (
-      session?.ttlMs &&
-      parsed.savedAt &&
-      nowMs() - parsed.savedAt > session.ttlMs
+      !parsed ||
+      typeof parsed !== "object" ||
+      !("version" in parsed) ||
+      parsed.version !== 1
     ) {
       clearSessionStorage();
       return null;
     }
-    if (parsed.sessionKey) {
+
+    const typedParsed = parsed as PersistedSession;
+
+    if (
+      session?.ttlMs &&
+      typedParsed.savedAt &&
+      nowMs() - typedParsed.savedAt > session.ttlMs
+    ) {
+      clearSessionStorage();
+      return null;
+    }
+    if (typedParsed.sessionKey) {
       try {
-        const rawKey = base64ToBytes(parsed.sessionKey);
+        const rawKey = base64ToBytes(typedParsed.sessionKey);
         sessionEncryptKey = await importKeyRaw(toArrayBuffer(rawKey));
-        sessionEncryptKeyId = parsed.sessionKeyId;
+        sessionEncryptKeyId = typedParsed.sessionKeyId;
       } catch (err) {
         emit("error", err);
       }
     }
-    return parsed;
+    return typedParsed;
   };
 
   const initializeSession = async () => {
@@ -2653,8 +2782,17 @@ export function createXfer(target: XferTarget, options: XferOptions = {}): Xfer 
           ) {
             continue;
           }
-          const meta =
-            entry.meta !== undefined ? parseWithTags(entry.meta) : undefined;
+          let meta: unknown = undefined;
+          if (entry.meta !== undefined) {
+            try {
+              meta = parseWithTags(entry.meta);
+            } catch (err) {
+              emit("error", new Error(
+                `Failed to restore inbound stream meta: ${err instanceof Error ? err.message : String(err)}`
+              ));
+              continue;
+            }
+          }
           const streamEntry = createStreamEntry(entry.id, meta);
           if (!streamEntry) {
             continue;
@@ -2717,7 +2855,6 @@ export function createXfer(target: XferTarget, options: XferOptions = {}): Xfer 
           pendingStreamChunks.set(key, stateEntry);
           scheduleStreamAckTimeout(stateEntry);
           postStreamChunk(stateEntry);
-          void stateEntry.deferred.promise.catch(() => {});
         }
       }
       resumeRequests = [];
@@ -2766,7 +2903,9 @@ export function createXfer(target: XferTarget, options: XferOptions = {}): Xfer 
               emit("error", err);
             }
           };
-          void resumeSend();
+          resumeSend().catch((err) => {
+            emit("error", err);
+          });
         }
       }
     } finally {
@@ -2808,7 +2947,9 @@ export function createXfer(target: XferTarget, options: XferOptions = {}): Xfer 
             }
           }
         };
-        void resume();
+        resume().catch((err) => {
+          emit("error", err);
+        });
       }
     }
   };
@@ -2894,6 +3035,7 @@ export function createXfer(target: XferTarget, options: XferOptions = {}): Xfer 
         });
         if (handshakeState?.timer) {
           clearTimeout(handshakeState.timer);
+          handshakeState.timer = undefined;
         }
         handshakeState?.deferred.resolve(shared);
         handshakeState = null;
@@ -2934,6 +3076,7 @@ export function createXfer(target: XferTarget, options: XferOptions = {}): Xfer 
         });
         if (handshakeState.timer) {
           clearTimeout(handshakeState.timer);
+          handshakeState.timer = undefined;
         }
         handshakeState.deferred.resolve(shared);
         handshakeState = null;
@@ -3000,6 +3143,7 @@ export function createXfer(target: XferTarget, options: XferOptions = {}): Xfer 
     } catch (err) {
       if (handshakeState?.timer) {
         clearTimeout(handshakeState.timer);
+        handshakeState.timer = undefined;
       }
       handshakeState?.deferred.reject(err);
       handshakeState = null;

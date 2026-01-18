@@ -110,8 +110,17 @@ export function isFrame(value: unknown): value is Frame {
   if (!value || typeof value !== "object") {
     return false;
   }
-  const candidate = value as Frame;
-  return candidate.__xferkit === 1 && candidate.v === XFERKIT_VERSION;
+  return (
+    "__xferkit" in value &&
+    value.__xferkit === 1 &&
+    "v" in value &&
+    value.v === XFERKIT_VERSION &&
+    "kind" in value &&
+    (value.kind === "data" ||
+      value.kind === "ack" ||
+      value.kind === "nack" ||
+      value.kind === "control")
+  );
 }
 
 export function isDataFrame(frame: Frame): frame is DataFrame {

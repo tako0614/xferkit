@@ -22,11 +22,24 @@ type EncodeState = {
 export function stringifyWithTags(value: unknown): string {
   const state: EncodeState = { seen: new WeakMap(), nextId: 1 };
   const encoded = encodeValue(value, state);
-  return JSON.stringify(encoded);
+  try {
+    return JSON.stringify(encoded);
+  } catch (err) {
+    throw new Error(
+      `Failed to stringify value: ${err instanceof Error ? err.message : String(err)}`
+    );
+  }
 }
 
 export function parseWithTags(text: string): unknown {
-  const decoded = JSON.parse(text);
+  let decoded: unknown;
+  try {
+    decoded = JSON.parse(text);
+  } catch (err) {
+    throw new Error(
+      `Failed to parse JSON: ${err instanceof Error ? err.message : String(err)}`
+    );
+  }
   const refs = new Map<number, unknown>();
   collectRefs(decoded, refs);
   return inflate(decoded, refs);
@@ -178,7 +191,11 @@ function inflate(node: unknown, refs: Map<number, unknown>): unknown {
     }
     case "Object": {
       const payload = tagged as { id: number; value: Record<string, unknown> };
-      const target = (refs.get(payload.id) as Record<string, unknown>) ?? {};
+      const ref = refs.get(payload.id);
+      const target: Record<string, unknown> =
+        ref && typeof ref === "object" && !Array.isArray(ref) && !(ref instanceof Map) && !(ref instanceof Set)
+          ? (ref as Record<string, unknown>)
+          : {};
       for (const [key, value] of Object.entries(payload.value)) {
         target[key] = inflate(value, refs);
       }
@@ -186,7 +203,8 @@ function inflate(node: unknown, refs: Map<number, unknown>): unknown {
     }
     case "Array": {
       const payload = tagged as { id: number; items: unknown[] };
-      const target = (refs.get(payload.id) as unknown[]) ?? [];
+      const ref = refs.get(payload.id);
+      const target: unknown[] = Array.isArray(ref) ? ref : [];
       target.length = 0;
       for (const item of payload.items) {
         target.push(inflate(item, refs));
@@ -195,7 +213,8 @@ function inflate(node: unknown, refs: Map<number, unknown>): unknown {
     }
     case "Map": {
       const payload = tagged as { id: number; entries: [unknown, unknown][] };
-      const target = (refs.get(payload.id) as Map<unknown, unknown>) ?? new Map();
+      const ref = refs.get(payload.id);
+      const target: Map<unknown, unknown> = ref instanceof Map ? ref : new Map();
       target.clear();
       for (const [key, value] of payload.entries) {
         target.set(inflate(key, refs), inflate(value, refs));
@@ -204,7 +223,8 @@ function inflate(node: unknown, refs: Map<number, unknown>): unknown {
     }
     case "Set": {
       const payload = tagged as { id: number; values: unknown[] };
-      const target = (refs.get(payload.id) as Set<unknown>) ?? new Set();
+      const ref = refs.get(payload.id);
+      const target: Set<unknown> = ref instanceof Set ? ref : new Set();
       target.clear();
       for (const value of payload.values) {
         target.add(inflate(value, refs));
