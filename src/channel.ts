@@ -373,6 +373,13 @@ export function createXfer(target: XferTarget, options: XferOptions = {}): Xfer 
       sendOptions?.signal
     );
     const reserved = await waitForSlot(requireAck, sendOptions?.signal);
+    if (sendOptions?.signal?.aborted) {
+      if (reserved) {
+        inFlight -= 1;
+        releaseSlot();
+      }
+      throw new DOMException("Aborted", "AbortError");
+    }
     dispatchMessage(message, reserved);
     return message.deferred.promise;
   };
@@ -398,6 +405,13 @@ export function createXfer(target: XferTarget, options: XferOptions = {}): Xfer 
       50
     );
     const reserved = await waitForSlot(requireAck, sendOptions?.signal);
+    if (sendOptions?.signal?.aborted) {
+      if (reserved) {
+        inFlight -= 1;
+        releaseSlot();
+      }
+      throw new DOMException("Aborted", "AbortError");
+    }
     try {
       await sendStreamInternal(stream, {
         requireAck,
@@ -1168,12 +1182,14 @@ export function createXfer(target: XferTarget, options: XferOptions = {}): Xfer 
       }
     }
     let splitOccurred = false;
-    const updateOffset = (delta: number) => {
+    const updateOffset = (delta: number, forceSave: boolean) => {
       offsetBytes += delta;
       if (streamState) {
         streamState.offsetBytes = offsetBytes;
         streamState.lastActivity = nowMs();
-        requestSessionSave();
+        if (forceSave) {
+          requestSessionSave(true);
+        }
       }
     };
     const windowSize = Math.max(1, reliability.chunkWindowSize ?? 8);
@@ -1233,7 +1249,7 @@ export function createXfer(target: XferTarget, options: XferOptions = {}): Xfer 
               false,
               meta,
               sendOptions,
-              () => updateOffset(chunkSize)
+              () => updateOffset(chunkSize, !sendOptions.requireAck)
             )
           );
           metaSent = true;
@@ -1278,7 +1294,7 @@ export function createXfer(target: XferTarget, options: XferOptions = {}): Xfer 
       ackTimeoutMs: number;
       signal?: AbortSignal;
     },
-    onQueued?: () => void
+    onPersist?: () => void
   ) => {
     if (sendOptions.signal?.aborted) {
       throw new DOMException("Aborted", "AbortError");
@@ -1328,7 +1344,7 @@ export function createXfer(target: XferTarget, options: XferOptions = {}): Xfer 
         transferList,
         options.targetOrigin
       );
-      onQueued?.();
+      onPersist?.();
       return;
     }
 
@@ -1351,12 +1367,12 @@ export function createXfer(target: XferTarget, options: XferOptions = {}): Xfer 
 
     const key = streamChunkKey(streamId, seq);
     pendingStreamChunks.set(key, state);
+    onPersist?.();
     if (persistOutboundEnabled) {
       requestSessionSave(true);
     }
     scheduleStreamAckTimeout(state);
     postStreamChunk(state);
-    onQueued?.();
     const onAbort = () => {
       pendingStreamChunks.delete(key);
       if (state.timer) {
@@ -2735,7 +2751,16 @@ export function createXfer(target: XferTarget, options: XferOptions = {}): Xfer 
       if (resumed.length > 0) {
         for (const message of resumed) {
           emitStatus({ type: "resume", id: message.id });
-          dispatchMessage(message);
+          const resumeSend = async () => {
+            try {
+              const reserved = await waitForSlot(message.requireAck, undefined);
+              dispatchMessage(message, reserved);
+            } catch (err) {
+              message.deferred.reject(err);
+              emit("error", err);
+            }
+          };
+          void resumeSend();
         }
       }
     } finally {
