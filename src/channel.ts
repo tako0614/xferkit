@@ -695,6 +695,10 @@ export function createXfer(target: XferTarget, options: XferOptions = {}): Xfer 
       const waiter = createDeferred<void>();
       slotWaiters.push(waiter);
       const onAbort = () => {
+        const index = slotWaiters.indexOf(waiter);
+        if (index >= 0) {
+          slotWaiters.splice(index, 1);
+        }
         waiter.reject(new DOMException("Aborted", "AbortError"));
       };
       signal?.addEventListener("abort", onAbort, { once: true });
@@ -1182,14 +1186,11 @@ export function createXfer(target: XferTarget, options: XferOptions = {}): Xfer 
       }
     }
     let splitOccurred = false;
-    const updateOffset = (delta: number, forceSave: boolean) => {
+    const updateOffset = (delta: number) => {
       offsetBytes += delta;
       if (streamState) {
         streamState.offsetBytes = offsetBytes;
         streamState.lastActivity = nowMs();
-        if (forceSave) {
-          requestSessionSave(true);
-        }
       }
     };
     const windowSize = Math.max(1, reliability.chunkWindowSize ?? 8);
@@ -1249,7 +1250,7 @@ export function createXfer(target: XferTarget, options: XferOptions = {}): Xfer 
               false,
               meta,
               sendOptions,
-              () => updateOffset(chunkSize, !sendOptions.requireAck)
+              () => updateOffset(chunkSize)
             )
           );
           metaSent = true;
@@ -1258,6 +1259,9 @@ export function createXfer(target: XferTarget, options: XferOptions = {}): Xfer 
             streamState.metaSent = metaSent;
             streamState.nextSeq = seq;
             streamState.lastActivity = nowMs();
+            if (!sendOptions.requireAck) {
+              requestSessionSave(true);
+            }
           }
         }
         if (streamState) {
@@ -1430,6 +1434,7 @@ export function createXfer(target: XferTarget, options: XferOptions = {}): Xfer 
       }
       stats.droppedMessages += 1;
       state.deferred.reject(new Error("xferkit stream ack timeout"));
+      outboundStreamStates.delete(id);
       if (persistOutboundEnabled) {
         requestSessionSave(true);
       }
@@ -1475,6 +1480,7 @@ export function createXfer(target: XferTarget, options: XferOptions = {}): Xfer 
       pendingStreamChunks.delete(key);
       stats.droppedMessages += 1;
       state.deferred.reject(new Error(reason ?? "xferkit stream nack"));
+      outboundStreamStates.delete(id);
       if (persistOutboundEnabled) {
         requestSessionSave(true);
       }
