@@ -128,6 +128,7 @@ type StreamChunkState = {
   deferred: ReturnType<typeof createDeferred<void>>;
   timer?: ReturnType<typeof setTimeout>;
   abortHandler?: () => void;
+  signal?: AbortSignal;
 };
 
 type OutboundStreamState = {
@@ -487,8 +488,12 @@ export function createXfer(target: XferTarget, options: XferOptions = {}): Xfer 
     streams.forEach((entry) => {
       try {
         entry.controller.close();
-      } catch {
-        // ignore
+      } catch (err) {
+        // Safe to ignore: controller may already be closed/errored during cleanup
+        // Only log in development to aid debugging without production noise
+        if (typeof process !== 'undefined' && process.env?.NODE_ENV === 'development') {
+          console.debug('xferkit: stream controller close failed during channel cleanup (expected if already closed)', err);
+        }
       }
     });
     streams.clear();
@@ -507,8 +512,12 @@ export function createXfer(target: XferTarget, options: XferOptions = {}): Xfer 
     for (const controller of messageStreamControllers) {
       try {
         controller.close();
-      } catch {
-        // ignore
+      } catch (err) {
+        // Safe to ignore: controller may already be closed/errored during cleanup
+        // Only log in development to aid debugging without production noise
+        if (typeof process !== 'undefined' && process.env?.NODE_ENV === 'development') {
+          console.debug('xferkit: message stream controller close failed during channel cleanup (expected if already closed)', err);
+        }
       }
     }
     messageStreamControllers.clear();
@@ -525,9 +534,10 @@ export function createXfer(target: XferTarget, options: XferOptions = {}): Xfer 
           for (const errorHandler of listeners.error) {
             try {
               errorHandler(err);
-            } catch {
-              // Prevent recursive error handling
-              console.error("xferkit: error handler threw an error", err);
+            } catch (handlerErr) {
+              // Safe to ignore: Prevent recursive error handling loop
+              // Always log this case as it indicates a user error handler is throwing
+              console.error("xferkit: error handler threw an error", handlerErr);
             }
           }
         } else {
@@ -1394,6 +1404,7 @@ export function createXfer(target: XferTarget, options: XferOptions = {}): Xfer 
       attempt: 0,
       lastActivity: nowMs(),
       deferred: createDeferred<void>(),
+      signal: sendOptions.signal,
     };
 
     const key = streamChunkKey(streamId, seq);
@@ -1418,6 +1429,10 @@ export function createXfer(target: XferTarget, options: XferOptions = {}): Xfer 
     try {
       await state.deferred.promise;
     } finally {
+      if (state.timer) {
+        clearTimeout(state.timer);
+        state.timer = undefined;
+      }
       if (sendOptions.signal && state.abortHandler) {
         sendOptions.signal.removeEventListener("abort", state.abortHandler);
         state.abortHandler = undefined;
@@ -1458,6 +1473,11 @@ export function createXfer(target: XferTarget, options: XferOptions = {}): Xfer 
       pendingStreamChunks.delete(key);
       if (state.timer) {
         clearTimeout(state.timer);
+        state.timer = undefined;
+      }
+      if (state.abortHandler && state.signal) {
+        state.signal.removeEventListener("abort", state.abortHandler);
+        state.abortHandler = undefined;
       }
       stats.droppedMessages += 1;
       state.deferred.reject(new Error("xferkit stream ack timeout"));
@@ -1490,6 +1510,11 @@ export function createXfer(target: XferTarget, options: XferOptions = {}): Xfer 
     pendingStreamChunks.delete(key);
     if (state.timer) {
       clearTimeout(state.timer);
+      state.timer = undefined;
+    }
+    if (state.abortHandler && state.signal) {
+      state.signal.removeEventListener("abort", state.abortHandler);
+      state.abortHandler = undefined;
     }
     state.deferred.resolve();
     if (persistOutboundEnabled) {
@@ -1509,6 +1534,10 @@ export function createXfer(target: XferTarget, options: XferOptions = {}): Xfer 
     }
     if (state.retriesLeft <= 0) {
       pendingStreamChunks.delete(key);
+      if (state.abortHandler && state.signal) {
+        state.signal.removeEventListener("abort", state.abortHandler);
+        state.abortHandler = undefined;
+      }
       stats.droppedMessages += 1;
       state.deferred.reject(new Error(reason ?? "xferkit stream nack"));
       outboundStreamStates.delete(id);
@@ -1754,8 +1783,12 @@ export function createXfer(target: XferTarget, options: XferOptions = {}): Xfer 
     }
     try {
       entry.controller.close();
-    } catch {
-      // ignore
+    } catch (err) {
+      // Safe to ignore: controller may already be closed/errored before tryCloseStream is called
+      // Only log in development to aid debugging without production noise
+      if (typeof process !== 'undefined' && process.env?.NODE_ENV === 'development') {
+        console.debug('xferkit: stream controller close failed in tryCloseStream (expected if already closed)', err);
+      }
     }
     streams.delete(entry.id);
     recentStreams.set(entry.id, nowMs());
@@ -1964,8 +1997,12 @@ export function createXfer(target: XferTarget, options: XferOptions = {}): Xfer 
         if (entry.controller.desiredSize !== null) {
           try {
             entry.controller.error(new Error("xferkit stream timeout"));
-          } catch {
-            // Controller may have been closed/errored between the check and the call
+          } catch (err) {
+            // Safe to ignore: controller may have been closed/errored between the desiredSize check and this call
+            // This is a TOCTOU (time-of-check-to-time-of-use) race condition that's harmless
+            if (typeof process !== 'undefined' && process.env?.NODE_ENV === 'development') {
+              console.debug('xferkit: stream controller.error failed during timeout cleanup (expected race condition)', err);
+            }
           }
         }
         streams.delete(id);
@@ -2399,7 +2436,12 @@ export function createXfer(target: XferTarget, options: XferOptions = {}): Xfer 
             combined += part;
           }
           return combined;
-        } catch {
+        } catch (err) {
+          // Safe to ignore: corrupted/invalid session data in storage
+          // Returning null signals to caller that session cannot be restored
+          if (typeof process !== 'undefined' && process.env?.NODE_ENV === 'development') {
+            console.debug('xferkit: failed to read chunked session data from storage (may be corrupted)', err);
+          }
           return null;
         }
       }
@@ -2651,8 +2693,12 @@ export function createXfer(target: XferTarget, options: XferOptions = {}): Xfer 
           const raw = await exportKeyRaw(sessionEncryptKey);
           state.sessionKey = bytesToBase64(new Uint8Array(raw));
           state.sessionKeyId = sessionEncryptKeyId;
-        } catch {
-          // ignore key export errors
+        } catch (err) {
+          // Safe to ignore: session key export may fail in some environments (e.g., non-extractable keys)
+          // Session will still be saved without encryption key - streams will continue without persistence
+          if (typeof process !== 'undefined' && process.env?.NODE_ENV === 'development') {
+            console.debug('xferkit: failed to export session encryption key (session will save without key)', err);
+          }
         }
       }
       const hasState =
@@ -2708,13 +2754,54 @@ export function createXfer(target: XferTarget, options: XferOptions = {}): Xfer 
       return null;
     }
 
-    // Validate parsed data
+    // Validate parsed data structure
     if (
       !parsed ||
       typeof parsed !== "object" ||
       !("version" in parsed) ||
       parsed.version !== 1
     ) {
+      clearSessionStorage();
+      return null;
+    }
+
+    // Validate PersistedSession structure
+    const obj = parsed as Record<string, unknown>;
+
+    // Check optional fields have correct types if present
+    if ("savedAt" in obj && typeof obj.savedAt !== "number" && obj.savedAt !== undefined) {
+      clearSessionStorage();
+      return null;
+    }
+    if ("nextSeq" in obj && typeof obj.nextSeq !== "number" && obj.nextSeq !== undefined) {
+      clearSessionStorage();
+      return null;
+    }
+    if ("outSeq" in obj && typeof obj.outSeq !== "number" && obj.outSeq !== undefined) {
+      clearSessionStorage();
+      return null;
+    }
+    if ("sessionKey" in obj && typeof obj.sessionKey !== "string" && obj.sessionKey !== undefined) {
+      clearSessionStorage();
+      return null;
+    }
+    if ("sessionKeyId" in obj && typeof obj.sessionKeyId !== "string" && obj.sessionKeyId !== undefined) {
+      clearSessionStorage();
+      return null;
+    }
+    if ("recentReceived" in obj && !Array.isArray(obj.recentReceived) && obj.recentReceived !== undefined) {
+      clearSessionStorage();
+      return null;
+    }
+    if ("recentStreams" in obj && !Array.isArray(obj.recentStreams) && obj.recentStreams !== undefined) {
+      clearSessionStorage();
+      return null;
+    }
+    if ("outbound" in obj && (typeof obj.outbound !== "object" || obj.outbound === null || Array.isArray(obj.outbound)) && obj.outbound !== undefined) {
+      clearSessionStorage();
+      return null;
+    }
+    if ("inbound" in obj && (typeof obj.inbound !== "object" || obj.inbound === null || Array.isArray(obj.inbound)) && obj.inbound !== undefined) {
       clearSessionStorage();
       return null;
     }

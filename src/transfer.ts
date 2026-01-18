@@ -62,6 +62,8 @@ export function collectTransferables(value: unknown): Transferable[] {
       return;
     }
 
+    // At this point, val is a plain object (not a special type like ArrayBuffer, Map, Set, etc.)
+    // Safe to cast to Record<string, unknown> and iterate over its values
     for (const item of Object.values(val as Record<string, unknown>)) {
       visit(item);
     }

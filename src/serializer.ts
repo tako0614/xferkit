@@ -119,7 +119,8 @@ function collectRefs(node: unknown, refs: Map<number, unknown>) {
   if (!(TAG in tagged)) {
     return;
   }
-  const tag = (tagged as any)[TAG] as TaggedValue[typeof TAG];
+  // Safe to access TAG property since we verified it exists with the 'in' operator
+  const tag = tagged[TAG];
   if (tag === "Ref") {
     return;
   }
@@ -184,7 +185,8 @@ function inflate(node: unknown, refs: Map<number, unknown>): unknown {
   if (!(TAG in tagged)) {
     return node;
   }
-  const tag = (tagged as any)[TAG] as TaggedValue[typeof TAG];
+  // Safe to access TAG property since we verified it exists with the 'in' operator
+  const tag = tagged[TAG];
   switch (tag) {
     case "Ref": {
       return refs.get((tagged as { id: number }).id);

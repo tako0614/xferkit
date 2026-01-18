@@ -283,7 +283,7 @@ async function compressBytes(
   bytes: Uint8Array,
   fallback?: "error" | "skip"
 ): Promise<{ bytes: Uint8Array; applied: boolean }> {
-  const global_ = globalThis as GlobalWithCompression;
+  const global_ = globalThis as typeof globalThis & Partial<GlobalWithCompression>;
   const CompressionStreamCtor = global_.CompressionStream;
 
   if (!CompressionStreamCtor) {
@@ -310,7 +310,7 @@ async function decompressBytes(
   algo: CompressAlgo,
   bytes: Uint8Array
 ): Promise<Uint8Array> {
-  const global_ = globalThis as GlobalWithCompression;
+  const global_ = globalThis as typeof globalThis & Partial<GlobalWithCompression>;
   const DecompressionStreamCtor = global_.DecompressionStream;
 
   if (!DecompressionStreamCtor) {
